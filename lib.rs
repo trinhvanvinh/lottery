@@ -30,140 +30,125 @@ mod lottery_test {
         NoEntries,
     }
     #[ink(event)]
-    pub struct Entered{
+    pub struct Entered {
         player: AccountId,
-        value: Balance
+        value: Balance,
     }
 
     #[ink(event)]
-    pub struct Won{
+    pub struct Won {
         winner: AccountId,
-        amount: Balance
+        amount: Balance,
     }
+
+    pub type Result<T> = core::result::Result<T, Error>;
 
     impl LotteryTest {
         /// Constructor that initializes the `bool` value to the given `init_value`.
         #[ink(constructor)]
         pub fn new(init_value: bool) -> Self {
-            Self { value: init_value }
+            Self {
+                value: init_value,
+                owner: Self::env().caller(),
+                running: false,
+                players: Vec::new(),
+                entries: Mapping::default(),
+            }
         }
 
-        /// Constructor that initializes the `bool` value to `false`.
-        ///
-        /// Constructors can delegate to other constructors.
-        #[ink(constructor)]
-        pub fn default() -> Self {
-            Self::new(Default::default())
-        }
-
-        /// A message that can be called on instantiated contracts.
-        /// This one flips the value of the stored `bool` from `true`
-        /// to `false` and vice versa.
         #[ink(message)]
-        pub fn flip(&mut self) {
-            self.value = !self.value;
+        pub fn owner(&self) -> AccountId {
+            self.owner
         }
-
-        /// Simply returns the current value of our `bool`.
         #[ink(message)]
-        pub fn get(&self) -> bool {
-            self.value
+        pub fn pot(&self) -> Balance {
+            self.env().balance()
         }
-    }
-
-    /// Unit tests in Rust are normally defined within such a `#[cfg(test)]`
-    /// module and test functions are marked with a `#[test]` attribute.
-    /// The below code is technically just normal Rust code.
-    #[cfg(test)]
-    mod tests {
-        /// Imports all the definitions from the outer scope so we can use them here.
-        use super::*;
-
-        /// We test if the default constructor does its job.
-        #[ink::test]
-        fn default_works() {
-            let lottery_test = LotteryTest::default();
-            assert_eq!(lottery_test.get(), false);
+        #[ink(message)]
+        pub fn is_running(&self) -> bool {
+            self.running
+        }
+        #[ink(message)]
+        pub fn get_players(&self) -> Vec<AccountId> {
+            self.players.clone()
+        }
+        #[ink(message)]
+        pub fn get_balances(&self, caller: AccountId) -> Option<Balance> {
+            self.entries.get(caller)
         }
 
-        /// We test a simple use case of our contract.
-        #[ink::test]
-        fn it_works() {
-            let mut lottery_test = LotteryTest::new(false);
-            assert_eq!(lottery_test.get(), false);
-            lottery_test.flip();
-            assert_eq!(lottery_test.get(), true);
+        fn seed(&self) -> u64 {
+            let hash = self.env().hash_encoded::<Keccak256, _>(&self.players);
+            let num = u64::from_be_bytes(hash[0..8].try_into().unwrap());
+            let timestamp = self.env().block_timestamp();
+            let block_number = self.env().block_number() as u64;
+            num ^ timestamp ^ block_number
         }
-    }
-
-    /// This is how you'd write end-to-end (E2E) or integration tests for ink! contracts.
-    ///
-    /// When running these you need to make sure that you:
-    /// - Compile the tests with the `e2e-tests` feature flag enabled (`--features e2e-tests`)
-    /// - Are running a Substrate node which contains `pallet-contracts` in the background
-    #[cfg(all(test, feature = "e2e-tests"))]
-    mod e2e_tests {
-        /// Imports all the definitions from the outer scope so we can use them here.
-        use super::*;
-
-        /// A helper function used for calling contract messages.
-        use ink_e2e::build_message;
-
-        /// The End-to-End test `Result` type.
-        type E2EResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-
-        /// We test that we can upload and instantiate the contract using its default constructor.
-        #[ink_e2e::test]
-        async fn default_works(mut client: ink_e2e::Client<C, E>) -> E2EResult<()> {
-            // Given
-            let constructor = LotteryTestRef::default();
-
-            // When
-            let contract_account_id = client
-                .instantiate("lottery_test", &ink_e2e::alice(), constructor, 0, None)
-                .await
-                .expect("instantiate failed")
-                .account_id;
-
-            // Then
-            let get = build_message::<LotteryTestRef>(contract_account_id.clone())
-                .call(|lottery_test| lottery_test.get());
-            let get_result = client.call_dry_run(&ink_e2e::alice(), &get, 0, None).await;
-            assert!(matches!(get_result.return_value(), false));
+        fn random(&self) -> u64 {
+            let mut x = self.seed();
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        }
+        #[ink(message, payable)]
+        pub fn enter(&mut self) -> Result<()> {
+            if !self.running {
+                return Err(Error::LotteryNotRunning);
+            }
+            let caller = self.env().caller();
+            let balance = self.entries.get(caller);
+            if balance.is_some() {
+                return Err(Error::PlayerAlreadyInLottery);
+            }
+            let value = self.env().transferred_value();
+            if value < 1 {
+                return Err(Error::NoValueSent);
+            }
+            self.players.push(caller);
+            self.entries.insert(caller, &value);
+            self.env().emit_event(Entered {
+                player: caller,
+                value,
+            });
 
             Ok(())
         }
 
-        /// We test that we can read and write a value from the on-chain contract contract.
-        #[ink_e2e::test]
-        async fn it_works(mut client: ink_e2e::Client<C, E>) -> E2EResult<()> {
-            // Given
-            let constructor = LotteryTestRef::new(false);
-            let contract_account_id = client
-                .instantiate("lottery_test", &ink_e2e::bob(), constructor, 0, None)
-                .await
-                .expect("instantiate failed")
-                .account_id;
+        #[ink(message)]
+        pub fn pick_winner(&mut self) -> Result<()> {
+            if self.players.len() == 0 {
+                return Err(Error::NoEntries);
+            }
+            let winner_index = self.random() % self.players.len() as u64;
+            let winner = self.players[winner_index as usize];
+            let amount = self.env().balance();
 
-            let get = build_message::<LotteryTestRef>(contract_account_id.clone())
-                .call(|lottery_test| lottery_test.get());
-            let get_result = client.call_dry_run(&ink_e2e::bob(), &get, 0, None).await;
-            assert!(matches!(get_result.return_value(), false));
+            if self.env().transfer(winner, amount).is_err() {
+                return Err(Error::ErrTransfer);
+            }
+            for player in self.players.iter() {
+                self.entries.remove(player);
+            }
+            self.players = Vec::new();
+            self.env().emit_event(Won { winner, amount });
+            Ok(())
+        }
+        #[ink(message)]
+        pub fn start_lottery(&mut self) -> Result<()> {
+            if self.env().caller() != self.owner{
+                return Err(Error::CallerNotOwner)
+            }
+            self.running = true;
+            Ok(())
+        }
 
-            // When
-            let flip = build_message::<LotteryTestRef>(contract_account_id.clone())
-                .call(|lottery_test| lottery_test.flip());
-            let _flip_result = client
-                .call(&ink_e2e::bob(), flip, 0, None)
-                .await
-                .expect("flip failed");
-
-            // Then
-            let get = build_message::<LotteryTestRef>(contract_account_id.clone())
-                .call(|lottery_test| lottery_test.get());
-            let get_result = client.call_dry_run(&ink_e2e::bob(), &get, 0, None).await;
-            assert!(matches!(get_result.return_value(), true));
-
+        #[ink(message)]
+        pub fn stop_lottery(&mut self) -> Result<()> {
+            if self.env().caller() != self.owner{
+                return Err(Error::CallerNotOwner)
+            }
+            self.running = false;
             Ok(())
         }
     }
